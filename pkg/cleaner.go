@@ -6,14 +6,41 @@ import (
 	"log"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/push"
+	"github.com/prometheus/common/expfmt"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
 
-const listSize = 10
+const (
+	listSize  = 10
+	ok        = "ok"
+	procErr   = "proc_error"
+	delErr    = "delete_error"
+	k8sconfig = "k8s_config_error"
+)
+
+var (
+	procTime = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "gw_pod_janitor_processing_time_millisecond",
+			Help:    "Time taken for pod janitor to process",
+			Buckets: []float64{5, 10, 100, 250, 500, 1000},
+		},
+	)
+
+	procPodTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gw_pod_janitor_cleanup_total",
+			Help: "Number of pods cleaned up by pod janitor",
+		},
+		[]string{"status"},
+	)
+)
 
 type CleanerArgs struct {
 	PodNamespace          string
@@ -43,7 +70,21 @@ func NewCleanerArgs(podNamespace string, deleteSuccessfulAfter, deleteFailedAfte
 	return cleanerArgs, nil
 }
 
+func PushMetrics(pushgatewayEndpoint string) {
+	if err := push.New(pushgatewayEndpoint, "pod-janitor").
+		Collector(procTime).
+		Collector(procPodTotal).
+		Format(expfmt.FmtText).
+		Push(); err != nil {
+		log.Printf("Failed to push metrics: %v", err)
+	}
+}
+
 func (ca CleanerArgs) RunCleaner() {
+	defer func(start time.Time) {
+		procTime.Observe(float64(time.Since(start).Milliseconds()))
+	}(time.Now())
+
 	err := ca.processPodList("status.phase=Succeeded")
 	if err != nil {
 		log.Printf("Failed to process succeeded Pods: %v", err)
@@ -60,6 +101,7 @@ func (ca CleanerArgs) processPodList(selector string) error {
 		Limit:         10,
 	})
 	if err != nil {
+		procPodTotal.WithLabelValues(procErr).Inc()
 		return fmt.Errorf("Failed to get list of pods for %v: %v", selector, err)
 	}
 	var cont string
@@ -72,6 +114,7 @@ func (ca CleanerArgs) processPodList(selector string) error {
 			Continue:      cont,
 		})
 		if err != nil {
+			procPodTotal.WithLabelValues(procErr).Inc()
 			return fmt.Errorf("Failed to get list of pods for %v: %v", selector, err)
 		}
 		cont = pods.Continue
@@ -87,10 +130,12 @@ func (ca CleanerArgs) clean(pods *[]corev1.Pod) {
 			err := ca.Client.CoreV1().Pods(ca.PodNamespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{})
 
 			if err != nil {
+				procPodTotal.WithLabelValues(delErr).Inc()
 				log.Printf("Failed to delete pod: %s %v", pod.Name, err)
 				continue
 			}
 
+			procPodTotal.WithLabelValues(ok).Inc()
 			log.Printf("Cleaned up pod %s", pod.Name)
 		}
 	}

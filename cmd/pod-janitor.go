@@ -11,6 +11,7 @@ import (
 var podNamespace = flag.String("pod-namespace", "", "The kubernetes namespace to run in")
 var deleteSuccessfulAfter = flag.Duration("delete-successful-after", 0*time.Minute, "Delete pods in succeeded state after X duration (golang duration format, e.g 5m), 0 - never delete")
 var deleteFailedAfter = flag.Duration("delete-failed-after", 0*time.Minute, "Delete pods in failed state after X duration (golang duration format, e.g 5m), 0 - never delete")
+var pushgatewayEndpoint = flag.String("pushgateway-endpoint", "", "Endpoint for the prometheus pushgateway")
 
 func main() {
 	flag.Parse()
@@ -19,10 +20,15 @@ func main() {
 		log.Fatalf("init failed: pod-namespace argument not set")
 	}
 
+	if *pushgatewayEndpoint == "" {
+		log.Fatalf("init failed: pushgateway-endpoint argument is not set")
+	}
+
 	cleanerArgs, err := cleaner.NewCleanerArgs(*podNamespace, *deleteSuccessfulAfter, *deleteFailedAfter)
 	if err != nil {
 		log.Fatalf("Failed to initialise Cleaner: %v", err)
 	}
 
 	cleanerArgs.RunCleaner()
+	cleaner.PushMetrics(*pushgatewayEndpoint)
 }
